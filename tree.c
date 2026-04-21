@@ -10,17 +10,91 @@
 //   "100644 hello.txt\0" followed by 32 raw bytes of SHA-256
 
 #include "tree.h"
+#include "index.h"
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
 #include <dirent.h>
 #include <sys/stat.h>
 
+#ifdef _WIN32
+#define lstat stat
+#endif
+
 // ─── Mode Constants ─────────────────────────────────────────────────────────
 
 #define MODE_FILE      0100644
 #define MODE_EXEC      0100755
 #define MODE_DIR       0040000
+
+// Forward declaration from object store module.
+int object_write(ObjectType type, const void *data, size_t len, ObjectID *id_out);
+
+typedef struct PathNode {
+    char name[256];
+    int is_file;
+    uint32_t mode;
+    ObjectID hash;
+    struct PathNode *children;
+    struct PathNode *next;
+} PathNode;
+
+static PathNode *node_find_child(PathNode *parent, const char *name) {
+    for (PathNode *n = parent->children; n; n = n->next) {
+        if (strcmp(n->name, name) == 0) return n;
+    }
+    return NULL;
+}
+
+static PathNode *node_get_or_create_child(PathNode *parent, const char *name, int is_file) {
+    PathNode *existing = node_find_child(parent, name);
+    if (existing) return existing;
+
+    PathNode *n = calloc(1, sizeof(PathNode));
+    if (!n) return NULL;
+    strncpy(n->name, name, sizeof(n->name) - 1);
+    n->is_file = is_file;
+    n->next = parent->children;
+    parent->children = n;
+    return n;
+}
+
+static void node_free(PathNode *node) {
+    while (node) {
+        PathNode *next = node->next;
+        node_free(node->children);
+        free(node);
+        node = next;
+    }
+}
+
+static int write_dir_node(PathNode *dir, ObjectID *id_out) {
+    Tree t;
+    t.count = 0;
+
+    for (PathNode *n = dir->children; n; n = n->next) {
+        if (t.count >= MAX_TREE_ENTRIES) return -1;
+
+        TreeEntry *e = &t.entries[t.count++];
+        snprintf(e->name, sizeof(e->name), "%s", n->name);
+
+        if (n->is_file) {
+            e->mode = n->mode;
+            e->hash = n->hash;
+        } else {
+            e->mode = MODE_DIR;
+            if (write_dir_node(n, &e->hash) != 0) return -1;
+        }
+    }
+
+    void *raw = NULL;
+    size_t raw_len = 0;
+    if (tree_serialize(&t, &raw, &raw_len) != 0) return -1;
+
+    int rc = object_write(OBJ_TREE, raw, raw_len, id_out);
+    free(raw);
+    return rc;
+}
 
 // ─── PROVIDED ───────────────────────────────────────────────────────────────
 
@@ -130,8 +204,50 @@ int tree_serialize(const Tree *tree, void **data_out, size_t *len_out) {
 //
 // Returns 0 on success, -1 on error.
 int tree_from_index(ObjectID *id_out) {
-    // TODO: Implement recursive tree building
-    // (See Lab Appendix for logical steps)
-    (void)id_out;
-    return -1;
+    Index *index = malloc(sizeof(Index));
+    if (!index) return -1;
+    if (index_load(index) != 0) {
+        free(index);
+        return -1;
+    }
+
+    PathNode root = {0};
+
+    for (int i = 0; i < index->count; i++) {
+        const IndexEntry *ie = &index->entries[i];
+
+        char path_copy[sizeof(ie->path)];
+        strncpy(path_copy, ie->path, sizeof(path_copy) - 1);
+        path_copy[sizeof(path_copy) - 1] = '\0';
+
+        PathNode *cur = &root;
+        char *saveptr = NULL;
+        char *part = strtok_r(path_copy, "/", &saveptr);
+
+        while (part) {
+            char *next = strtok_r(NULL, "/", &saveptr);
+            int is_file = (next == NULL);
+
+            PathNode *child = node_get_or_create_child(cur, part, is_file);
+            if (!child) {
+                node_free(root.children);
+                free(index);
+                return -1;
+            }
+
+            if (is_file) {
+                child->is_file = 1;
+                child->mode = ie->mode;
+                child->hash = ie->hash;
+            }
+
+            cur = child;
+            part = next;
+        }
+    }
+
+    int rc = write_dir_node(&root, id_out);
+    node_free(root.children);
+    free(index);
+    return rc;
 }
